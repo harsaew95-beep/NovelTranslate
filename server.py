@@ -1,5 +1,5 @@
 import base64, hmac, json, os, re, sqlite3, threading, urllib.request, urllib.error
-from browser_chat import translate_browser
+from browser_chat import translate_browser, BROWSER_LOCK
 from remote_login import REMOTE, validate_action
 from html.parser import HTMLParser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -51,6 +51,66 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         validate_url(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
+def browser_import_chapter(url):
+    """One ordinary browser attempt; no proxies, stealth, or challenge solving."""
+    validate_url(url)
+    if not BROWSER_LOCK.acquire(blocking=False):
+        raise ValueError('Браузер занят входом или переводом. Завершите текущую операцию и загрузите главу снова.')
+    try:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise ValueError('Для автоматической загрузки на сервере нужен Chromium/Playwright.') from exc
+        with sync_playwright() as p:
+            profile = ROOT / 'data' / 'royalroad-browser'
+            profile.mkdir(parents=True, exist_ok=True)
+            context = p.chromium.launch_persistent_context(
+                str(profile), headless=True,
+                viewport={'width': 1024, 'height': 768},
+                args=['--disable-dev-shm-usage'],
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                denied_redirect = []
+                def restrict_navigation(route):
+                    request = route.request
+                    if request.is_navigation_request() and request.frame == page.main_frame:
+                        try: validate_url(request.url)
+                        except ValueError:
+                            denied_redirect.append(True)
+                            return route.abort()
+                    return route.continue_()
+                page.route('**/*', restrict_navigation)
+                try:
+                    response = page.goto(url, wait_until='domcontentloaded', timeout=25000)
+                except Exception as exc:
+                    if denied_redirect:
+                        raise ValueError('Royal Road перенаправил на страницу вне открытой главы. Автоматическая загрузка остановлена.') from exc
+                    raise ValueError('Браузер не смог загрузить Royal Road за 25 секунд. Проверьте доступность сайта и журнал Render.') from exc
+                if response and response.status == 429:
+                    raise ValueError('Royal Road ограничил частоту запросов (HTTP 429). Автоматического повтора нет; попробуйте позже.')
+                content = page.locator('.chapter-content').first
+                try:
+                    content.wait_for(state='visible', timeout=15000)
+                except Exception as exc:
+                    if response and response.status in (401, 403):
+                        raise ValueError('Royal Road отказал и обычному браузеру на Render (HTTP %s). Автоматический импорт с этого сервера сейчас недоступен.' % response.status) from exc
+                    raise ValueError('В браузере не появился текст главы: возможна проверка доступа, удалённая глава или изменение разметки Royal Road.') from exc
+                validate_url(page.url)
+                text = content.inner_text(timeout=5000).strip()
+                if not text or len(text) > 150000:
+                    raise ValueError('Глава пуста или длиннее 150 000 символов.')
+                return {'title': page.title().strip(), 'original': text, 'url': url}
+            finally:
+                context.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError('Не удалось запустить браузер для Royal Road. Проверьте журнал Render: возможна нехватка памяти.') from exc
+    finally:
+        BROWSER_LOCK.release()
+
+
 def import_chapter(url):
     validate_url(url)
     req = urllib.request.Request(url, headers={'User-Agent': 'PersonalNovelReader/1.0', 'Accept': 'text/html'})
@@ -59,11 +119,17 @@ def import_chapter(url):
             raw = res.read(2_000_001)
             if len(raw) > 2_000_000: raise ValueError('Страница слишком большая.')
     except urllib.error.HTTPError as e:
-        raise ValueError(f'Royal Road вернул HTTP {e.code}. Скопируйте текст главы и вставьте вручную.') from e
+        if e.code == 403:
+            # Some public pages require a regular JavaScript-capable browser.
+            return browser_import_chapter(url)
+        if e.code == 429:
+            raise ValueError('Royal Road ограничил частоту запросов (HTTP 429). Попробуйте позже.') from e
+        raise ValueError(f'Royal Road вернул HTTP {e.code}. Автоматическая загрузка не выполнена.') from e
     parser = ChapterParser()
     parser.feed(raw.decode('utf-8', errors='replace'))
     title, text = parser.result()
-    if not text: raise ValueError('Текст главы не найден. Вставьте его вручную.')
+    if not text: return browser_import_chapter(url)
+    if len(text) > 150000: raise ValueError('Глава длиннее 150 000 символов.')
     return {'title': title, 'original': text, 'url': url}
 
 def chunks(text, limit=10000):
